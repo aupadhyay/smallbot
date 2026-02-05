@@ -4,10 +4,12 @@ import yaml from "js-yaml";
 
 export interface Config {
   streaming: boolean;
+  timezone: string;
 }
 
 const DEFAULT_CONFIG: Config = {
   streaming: true,
+  timezone: "UTC",
 };
 
 let config: Config | null = null;

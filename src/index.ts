@@ -9,6 +9,7 @@ import { loadMemories, createMemoryTools, loadTone, createToneTools } from "./me
 import { createCronTools, initCrons } from "./cron.js";
 import { loadPlugins } from "./plugins.js";
 import { runAgent, runAgentStreaming, runCronPrompt, setModel, getModelInfo, type StreamEvent } from "./agent.js";
+import { getPrompt } from "./prompts.js";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 
@@ -29,28 +30,6 @@ const bot = new Bot(BOT_TOKEN);
 
 // Load plugins at startup
 let pluginTools: AgentTool[] = [];
-
-const SYSTEM_PROMPT_TEMPLATE = `You are a helpful personal assistant on Telegram. You can run code,
-read/write files, search the web, and manage scheduled tasks on this machine.
-
-{tone}
-
-## Memory
-When the user tells you something worth remembering (preferences, facts,
-important info), use save_memory. Don't save trivial conversation.
-Their saved memories are below.
-
-## Tools
-- read/write/edit/bash: interact with the local filesystem and run commands
-- save_memory/recall_memories: persist info across conversations
-- web_search: search the internet for current info
-- fetch_url: fetch content from any URL (web pages, APIs, etc.)
-- create_cron/list_crons/delete_cron: schedule recurring tasks
-
-Be concise — this is a chat app, not an essay.
-
-## User's Memories
-{memories}`;
 
 // Auth middleware
 bot.use(async (ctx, next) => {
@@ -100,9 +79,11 @@ bot.on("message:text", async (ctx) => {
   const toneSection = tone 
     ? `## Tone and Identity\n${tone}`
     : `## Tone and Identity\nYour tone has not been set yet. Ask the user: "Who am I and what tone should I use?" Once they answer, use the set_tone tool to save their preferences.`;
-  const systemPrompt = SYSTEM_PROMPT_TEMPLATE
+  const { timezone } = getConfig();
+  const systemPrompt = getPrompt("system")
     .replace("{tone}", toneSection)
-    .replace("{memories}", memories || "(none)");
+    .replace("{memories}", memories || "(none)")
+    .replace("{timezone}", timezone);
 
   // Add user message to session
   const userMsg: Message = {

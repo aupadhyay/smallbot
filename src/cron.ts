@@ -5,6 +5,7 @@ import { Type } from "@sinclair/typebox";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Api } from "grammy";
 import { createLogger } from "./logger.js";
+import { getConfig } from "./config.js";
 
 const log = createLogger("cron");
 
@@ -53,6 +54,7 @@ function scheduleJob(
   botApi: Api,
   runCronPrompt: (prompt: string, chatId: number) => Promise<string>
 ) {
+  const { timezone } = getConfig();
   const task = cron.schedule(job.schedule, async () => {
     try {
       log.info(`Cron ${job.id} firing: ${job.prompt}`);
@@ -61,7 +63,7 @@ function scheduleJob(
     } catch (err) {
       log.error(`Cron ${job.id} error:`, err);
     }
-  });
+  }, { timezone });
   scheduledTasks.set(job.id, task);
 }
 
@@ -74,7 +76,7 @@ export function createCronTools(
     {
       name: "create_cron",
       description:
-        'Create a recurring scheduled task. Uses cron syntax (e.g. "0 9 * * *" for daily at 9am, "*/30 * * * *" for every 30 min).',
+        `Create a recurring scheduled task. Uses cron syntax (e.g. "0 9 * * *" for daily at 9am, "*/30 * * * *" for every 30 min). Timezone: ${getConfig().timezone}`,
       parameters: Type.Object({
         schedule: Type.String({ description: "Cron schedule expression" }),
         prompt: Type.String({

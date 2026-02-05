@@ -9,6 +9,7 @@ import {
 import { createCodingTools } from "@mariozechner/pi-coding-agent";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { createLogger } from "./logger.js";
+import { getPrompt } from "./prompts.js";
 
 const log = createLogger("agent");
 
@@ -244,7 +245,5 @@ export async function runCronPrompt(
   const messages: Message[] = [
     { role: "user", content: prompt, timestamp: Date.now() },
   ];
-  const systemPrompt =
-    "You are a scheduled task assistant. Execute the requested task concisely.";
-  return runAgent(messages, systemPrompt, customTools);
+  return runAgent(messages, getPrompt("cron"), customTools);
 }
