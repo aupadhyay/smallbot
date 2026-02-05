@@ -1,27 +1,22 @@
 import { createLogger } from "./logger.js";
 const log = createLogger("startup");
 
-log.info("Loading index.ts...");
 import "dotenv/config";
-log.info("dotenv loaded");
+import { getConfig } from "./config.js";
 import { Bot } from "grammy";
-log.info("grammy loaded");
 import { getSession, clearSession } from "./sessions.js";
-log.info("sessions loaded");
 import { loadMemories, createMemoryTools, loadTone, createToneTools } from "./memory.js";
-log.info("memory loaded");
 import { createCronTools, initCrons } from "./cron.js";
-log.info("cron loaded");
 import { loadPlugins } from "./plugins.js";
-log.info("plugins loaded");
-import { runAgent, runCronPrompt, setModel, getModelInfo } from "./agent.js";
-log.info("agent loaded");
+import { runAgent, runAgentStreaming, runCronPrompt, setModel, getModelInfo, type StreamEvent } from "./agent.js";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 
-log.info("All imports complete");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is required in .env");
+
+const config = getConfig();
+const { streaming } = config;
 
 const ALLOWED_USER_IDS = new Set(
   (process.env.ALLOWED_USER_IDS || "")
@@ -131,16 +126,132 @@ bot.on("message:text", async (ctx) => {
   ];
 
   try {
-    msgLog.info(`Starting agent for user ${userId}, messages: ${session.messages.length}, tools: ${allCustomTools.length}`);
+    let response: string;
 
-    const response = await runAgent(
-      session.messages,
-      systemPrompt,
-      allCustomTools
-    );
+    if (streaming) {
+      // === STREAMING MODE ===
+      msgLog.info(`Starting streaming agent for user ${userId}, messages: ${session.messages.length}, tools: ${allCustomTools.length}`);
 
-    msgLog.info(`Agent response for user ${userId}, length: ${response?.length || 0}`);
-    msgLog.debug(`Response preview: "${response?.substring(0, 100) || '(empty)'}..."`);
+      // Send initial placeholder message
+      const sentMsg = await ctx.reply("...");
+      const messageId = sentMsg.message_id;
+
+      // Streaming state
+      let lastEditTime = 0;
+      let lastEditedText = "";
+      const THROTTLE_MS = 500; // Telegram rate limit friendly
+      const MIN_CHARS_CHANGE = 20; // Don't edit for tiny changes
+
+      // Tool indicators
+      const toolEmojis: Record<string, string> = {
+        web_search: "🔍",
+        fetch_url: "🌐",
+        bash: "⚙️",
+        read: "📖",
+        write: "✏️",
+        edit: "✏️",
+        save_memory: "💾",
+        recall_memories: "🧠",
+        create_cron: "⏰",
+        default: "🔧",
+      };
+
+      const editMessage = async (newText: string, force = false) => {
+        const now = Date.now();
+        const textChanged = newText !== lastEditedText;
+        const significantChange = newText.length - lastEditedText.length >= MIN_CHARS_CHANGE;
+        const throttleOk = now - lastEditTime >= THROTTLE_MS;
+
+        if (textChanged && (force || (throttleOk && significantChange))) {
+          try {
+            // Truncate if over Telegram limit
+            const displayText = newText.length > 4000 ? newText.slice(-4000) + "\n\n[...truncated]" : newText;
+            await ctx.api.editMessageText(chatId, messageId, displayText || "...");
+            lastEditTime = now;
+            lastEditedText = newText;
+          } catch (e: any) {
+            // Ignore "message not modified" errors
+            if (!e.message?.includes("not modified")) {
+              msgLog.warn(`Edit failed: ${e.message}`);
+            }
+          }
+        }
+      };
+
+      // Process streaming events
+      let fullText = "";
+      let currentToolIndicator = "";
+
+      const streamGen = runAgentStreaming(session.messages, systemPrompt, allCustomTools);
+
+      for await (const event of streamGen) {
+        switch (event.type) {
+          case "text_delta":
+            fullText = event.accumulated;
+            await editMessage(fullText + currentToolIndicator);
+            break;
+
+          case "tool_start":
+            const emoji = toolEmojis[event.name] || toolEmojis.default;
+            currentToolIndicator = `\n\n${emoji} _${event.name}_...`;
+            await editMessage(fullText + currentToolIndicator, true);
+            break;
+
+          case "tool_end":
+            currentToolIndicator = "";
+            // Force an edit to clear the tool indicator
+            if (fullText) await editMessage(fullText, true);
+            break;
+
+          case "done":
+            fullText = event.fullText;
+            break;
+        }
+      }
+
+      // Final edit with complete response
+      await editMessage(fullText, true);
+
+      // If response is too long for a single message, send overflow as new messages
+      if (fullText.length > 4096) {
+        msgLog.info(`Response overflow: ${fullText.length} chars, sending as multiple messages`);
+        // Delete the streaming message and send properly chunked
+        try {
+          await ctx.api.deleteMessage(chatId, messageId);
+        } catch (e) {
+          // Ignore deletion errors
+        }
+        for (let i = 0; i < fullText.length; i += 4096) {
+          await ctx.reply(fullText.slice(i, i + 4096));
+        }
+      }
+
+      response = fullText;
+      msgLog.info(`Streaming complete for user ${userId}, final length: ${response.length}`);
+
+    } else {
+      // === NON-STREAMING MODE ===
+      msgLog.info(`Starting agent for user ${userId}, messages: ${session.messages.length}, tools: ${allCustomTools.length}`);
+
+      response = await runAgent(session.messages, systemPrompt, allCustomTools);
+
+      msgLog.info(`Agent response for user ${userId}, length: ${response?.length || 0}`);
+      msgLog.debug(`Response preview: "${response?.substring(0, 100) || '(empty)'}..."`);
+
+      // Split long messages
+      if (response.length <= 4096) {
+        msgLog.debug(`Sending single message to user ${userId}`);
+        await ctx.reply(response);
+        msgLog.info(`Reply sent to user ${userId}`);
+      } else {
+        const chunks = Math.ceil(response.length / 4096);
+        msgLog.info(`Sending ${chunks} chunks to user ${userId}`);
+        for (let i = 0; i < response.length; i += 4096) {
+          await ctx.reply(response.slice(i, i + 4096));
+          msgLog.debug(`Chunk ${Math.floor(i / 4096) + 1}/${chunks} sent`);
+        }
+      }
+    }
 
     // Add assistant response to session
     const assistantMsg: Message = {
@@ -155,19 +266,6 @@ bot.on("message:text", async (ctx) => {
     };
     session.messages.push(assistantMsg);
 
-    // Split long messages
-    if (response.length <= 4096) {
-      msgLog.debug(`Sending single message to user ${userId}`);
-      await ctx.reply(response);
-      msgLog.info(`Reply sent to user ${userId}`);
-    } else {
-      const chunks = Math.ceil(response.length / 4096);
-      msgLog.info(`Sending ${chunks} chunks to user ${userId}`);
-      for (let i = 0; i < response.length; i += 4096) {
-        await ctx.reply(response.slice(i, i + 4096));
-        msgLog.debug(`Chunk ${Math.floor(i / 4096) + 1}/${chunks} sent`);
-      }
-    }
   } catch (err: any) {
     msgLog.error(`Error for user ${userId}: ${err.message}`);
     msgLog.error(`Stack trace: ${err.stack}`);
@@ -191,7 +289,7 @@ async function main() {
 
   log.info("Starting bot...");
   bot.start();
-  log.info("Bot started successfully! 🚀");
+  log.info("Bot started successfully");
 }
 
 log.info("Executing main()...");
