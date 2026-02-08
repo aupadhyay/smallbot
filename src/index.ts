@@ -110,7 +110,17 @@ async function handleMessage(
 
   msgLog.info(`Received from user ${userId} in chat ${chatId}: text="${(text || "").substring(0, 100)}", attachments=${attachments.length}`);
 
-  await ctx.api.sendChatAction(chatId, "typing");
+  // Send typing indicator repeatedly until we respond
+  // Telegram's typing indicator expires after ~5 seconds
+  const sendTyping = () => ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+  await sendTyping();
+  const typingInterval = setInterval(sendTyping, 4000);
+  msgLog.debug(`Typing indicator started for chat ${chatId}`);
+
+  const stopTyping = () => {
+    clearInterval(typingInterval);
+    msgLog.debug(`Typing indicator stopped for chat ${chatId}`);
+  };
 
   const session = getSession(userId);
   const memories = loadMemories(userId);
@@ -197,6 +207,7 @@ async function handleMessage(
 
       // Send initial placeholder message
       const sentMsg = await ctx.reply("...");
+      stopTyping(); // Stop typing once we have a message to edit
       const messageId = sentMsg.message_id;
 
       // Streaming state
@@ -297,6 +308,7 @@ async function handleMessage(
       msgLog.info(`Starting agent for user ${userId}, messages: ${session.messages.length}, tools: ${allCustomTools.length}`);
 
       response = await runAgent(session.messages, systemPrompt, allCustomTools);
+      stopTyping(); // Stop typing once we have a response
 
       msgLog.info(`Agent response for user ${userId}, length: ${response?.length || 0}`);
       msgLog.debug(`Response preview: "${response?.substring(0, 100) || '(empty)'}..."`);
@@ -330,6 +342,7 @@ async function handleMessage(
     session.messages.push(assistantMsg);
 
   } catch (err: any) {
+    stopTyping(); // Clean up typing interval on error
     msgLog.error(`Error for user ${userId}: ${err.message}`);
     msgLog.error(`Stack trace: ${err.stack}`);
     await ctx.reply(`Error: ${err.message}`);
