@@ -10,7 +10,7 @@ import { createCronTools, initCrons } from "./cron.js";
 import { loadPlugins } from "./plugins.js";
 import { runAgent, runAgentStreaming, runCronPrompt, setModel, getModelInfo, type StreamEvent } from "./agent.js";
 import { getPrompt } from "./prompts.js";
-import type { Message } from "@mariozechner/pi-ai";
+import type { Message, TextContent, ImageContent } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -62,16 +62,55 @@ bot.command("model", async (ctx) => {
 // Create a logger for message handling
 const msgLog = createLogger("msg");
 
-// Main message handler
-bot.on("message:text", async (ctx) => {
+// Supported image MIME types for vision models
+const SUPPORTED_IMAGE_TYPES = new Set([
+  "image/jpeg", "image/png", "image/gif", "image/webp",
+]);
+
+// Supported document MIME types
+const SUPPORTED_DOC_TYPES = new Set([
+  "application/pdf",
+]);
+
+/**
+ * Download a file from Telegram's servers and return it as a base64 string.
+ */
+async function downloadTelegramFile(fileId: string): Promise<{ data: string; mimeType: string }> {
+  const file = await bot.api.getFile(fileId);
+  const filePath = file.file_path!;
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to download file: ${res.status} ${res.statusText}`);
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const data = buffer.toString("base64");
+
+  // Infer MIME type from file extension if not provided
+  const ext = filePath.split(".").pop()?.toLowerCase();
+  const extToMime: Record<string, string> = {
+    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+    gif: "image/gif", webp: "image/webp", pdf: "application/pdf",
+  };
+  const mimeType = extToMime[ext || ""] || "application/octet-stream";
+
+  return { data, mimeType };
+}
+
+/**
+ * Core message handler — processes text + optional attachments and sends to the model.
+ */
+async function handleMessage(
+  ctx: any,
+  text: string | undefined,
+  attachments: { fileId: string; mimeType?: string; fileName?: string }[]
+) {
   const userId = ctx.from!.id;
   const chatId = ctx.chat.id;
-  const text = ctx.message.text;
 
-  msgLog.info(`Received from user ${userId} in chat ${chatId}: "${text.substring(0, 100)}..."`);
+  msgLog.info(`Received from user ${userId} in chat ${chatId}: text="${(text || "").substring(0, 100)}", attachments=${attachments.length}`);
 
   await ctx.api.sendChatAction(chatId, "typing");
-  msgLog.debug(`Typing indicator sent to chat ${chatId}`);
 
   const session = getSession(userId);
   const memories = loadMemories(userId);
@@ -85,10 +124,53 @@ bot.on("message:text", async (ctx) => {
     .replace("{memories}", memories || "(none)")
     .replace("{timezone}", timezone);
 
+  // Build user message content
+  let content: string | (TextContent | ImageContent)[];
+
+  if (attachments.length === 0) {
+    // Plain text message
+    content = text || "";
+  } else {
+    // Multi-part content: text + attachments
+    const parts: (TextContent | ImageContent)[] = [];
+
+    if (text) {
+      parts.push({ type: "text", text });
+    }
+
+    for (const att of attachments) {
+      try {
+        msgLog.info(`Downloading attachment: ${att.fileName || att.fileId} (${att.mimeType || "unknown"})`);
+        const { data, mimeType } = await downloadTelegramFile(att.fileId);
+        const resolvedMime = att.mimeType || mimeType;
+        msgLog.info(`Downloaded ${att.fileName || att.fileId}: ${resolvedMime}, ${Math.round(data.length / 1024)}KB base64`);
+        parts.push({ type: "image", data, mimeType: resolvedMime });
+      } catch (err: any) {
+        msgLog.error(`Failed to download attachment: ${err.message}`);
+        const isTooBig = err.message?.includes("file is too big");
+        const name = att.fileName || "the file";
+        if (isTooBig) {
+          parts.push({ type: "text", text:
+            `[The user attached "${name}" (${att.mimeType || "unknown type"}) but it exceeds Telegram's 20MB bot download limit. ` +
+            `Suggest they share a link/URL to the file instead — you can use the fetch_url tool to retrieve it.]`
+          });
+        } else {
+          parts.push({ type: "text", text: `[Failed to load attachment "${name}": ${err.message}]` });
+        }
+      }
+    }
+
+    if (parts.length === 0) {
+      parts.push({ type: "text", text: text || "" });
+    }
+
+    content = parts;
+  }
+
   // Add user message to session
   const userMsg: Message = {
     role: "user",
-    content: text,
+    content,
     timestamp: Date.now(),
   };
   session.messages.push(userMsg);
@@ -252,6 +334,43 @@ bot.on("message:text", async (ctx) => {
     msgLog.error(`Stack trace: ${err.stack}`);
     await ctx.reply(`Error: ${err.message}`);
   }
+}
+
+// Text-only messages
+bot.on("message:text", async (ctx) => {
+  await handleMessage(ctx, ctx.message.text, []);
+});
+
+// Photo messages (images sent directly or as compressed photos)
+bot.on("message:photo", async (ctx) => {
+  // Telegram provides multiple sizes; pick the largest (last in array)
+  const photos = ctx.message.photo;
+  const largest = photos[photos.length - 1];
+  const caption = ctx.message.caption || undefined;
+
+  await handleMessage(ctx, caption, [
+    { fileId: largest.file_id, mimeType: "image/jpeg" }, // Telegram always converts photos to JPEG
+  ]);
+});
+
+// Document messages (PDFs, high-res images sent as files, etc.)
+bot.on("message:document", async (ctx) => {
+  const doc = ctx.message.document;
+  const caption = ctx.message.caption || undefined;
+  const mimeType = doc.mime_type || "application/octet-stream";
+
+  // Check if this is a supported file type
+  if (!SUPPORTED_IMAGE_TYPES.has(mimeType) && !SUPPORTED_DOC_TYPES.has(mimeType)) {
+    await ctx.reply(
+      `Unsupported file type: ${mimeType}\n` +
+      `Supported: images (JPEG, PNG, GIF, WebP) and PDFs.`
+    );
+    return;
+  }
+
+  await handleMessage(ctx, caption, [
+    { fileId: doc.file_id, mimeType, fileName: doc.file_name || undefined },
+  ]);
 });
 
 // Start bot
