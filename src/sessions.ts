@@ -1,13 +1,18 @@
 import type { Message } from "@mariozechner/pi-ai";
 
-interface Session {
+export interface Session {
   messages: Message[];
   lastActivity: number;
 }
 
 const sessions = new Map<number, Session>();
 
-const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+type PreClearHook = (userId: number, session: Session) => Promise<void>;
+let preClearHook: PreClearHook | null = null;
+
+export function onBeforeClear(hook: PreClearHook) {
+  preClearHook = hook;
+}
 
 export function getSession(userId: number): Session {
   let session = sessions.get(userId);
@@ -19,7 +24,15 @@ export function getSession(userId: number): Session {
   return session;
 }
 
-export function clearSession(userId: number) {
+export async function clearSession(userId: number) {
+  const session = sessions.get(userId);
+  if (session && session.messages.length > 0 && preClearHook) {
+    try {
+      await preClearHook(userId, session);
+    } catch (e: any) {
+      // Don't block clearing if hook fails
+    }
+  }
   sessions.delete(userId);
 }
 
@@ -28,13 +41,3 @@ export function addMessage(userId: number, message: Message) {
   session.messages.push(message);
   session.lastActivity = Date.now();
 }
-
-// Cleanup idle sessions every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [userId, session] of sessions) {
-    if (now - session.lastActivity > SESSION_TIMEOUT) {
-      sessions.delete(userId);
-    }
-  }
-}, 5 * 60 * 1000);

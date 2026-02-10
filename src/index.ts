@@ -4,7 +4,7 @@ const log = createLogger("startup");
 import "dotenv/config";
 import { getConfig } from "./config.js";
 import { Bot } from "grammy";
-import { getSession, clearSession } from "./sessions.js";
+import { getSession, clearSession, onBeforeClear, type Session } from "./sessions.js";
 import { loadMemories, createMemoryTools, loadTone, createToneTools } from "./memory.js";
 import { createCronTools, initCrons } from "./cron.js";
 import { loadPlugins } from "./plugins.js";
@@ -41,10 +41,49 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
-// /clear command
+// Memory consolidation interval — every N user messages, force a memory pass
+const MEMORY_CHECKPOINT_INTERVAL = 20;
+
+/**
+ * Run a silent memory consolidation pass — a separate agent call
+ * that reviews recent conversation and saves anything important.
+ */
+async function runMemoryConsolidation(userId: number, messages: Message[]) {
+  const memoryTools = createMemoryTools(userId);
+  const consolidationPrompt =
+    `You are a memory extraction system. Review the conversation and save any important information using save_memory. ` +
+    `Focus on: user preferences, facts about the user, decisions made, action items, important context for future conversations. ` +
+    `Do NOT save trivial chit-chat. Do NOT respond to the user. Just call save_memory for each important piece of info. ` +
+    `If there is nothing worth saving, respond with "No new memories to save."`;
+
+  const recentMessages: Message[] = [
+    ...messages.slice(-MEMORY_CHECKPOINT_INTERVAL),
+    {
+      role: "user" as const,
+      content: "Review the conversation above and save anything important to memory now.",
+      timestamp: Date.now(),
+    },
+  ];
+
+  try {
+    await runAgent(recentMessages, consolidationPrompt, memoryTools);
+    msgLog.info(`Memory consolidation complete for user ${userId}`);
+  } catch (err: any) {
+    msgLog.error(`Memory consolidation failed for user ${userId}: ${err.message}`);
+  }
+}
+
+// /clear command — clearSession's onBeforeClear hook handles memory consolidation
 bot.command("clear", async (ctx) => {
-  clearSession(ctx.from!.id);
-  await ctx.reply("Session cleared.");
+  const userId = ctx.from!.id;
+  const session = getSession(userId);
+
+  if (session.messages.length > 0) {
+    await ctx.reply("Saving memories before clearing. This may take a few seconds...");
+  }
+
+  await clearSession(userId);
+  await ctx.reply("Session cleared. Memories preserved.");
 });
 
 // /model command
@@ -341,6 +380,14 @@ async function handleMessage(
     };
     session.messages.push(assistantMsg);
 
+    // Memory checkpoint — every N user messages, run a silent consolidation pass
+    const userMsgCount = session.messages.filter(m => m.role === "user").length;
+    if (userMsgCount > 0 && userMsgCount % MEMORY_CHECKPOINT_INTERVAL === 0) {
+      msgLog.info(`Memory checkpoint triggered at ${userMsgCount} user messages for user ${userId}`);
+      // Run in background — don't block the user's response
+      runMemoryConsolidation(userId, session.messages).catch(() => {});
+    }
+
   } catch (err: any) {
     stopTyping(); // Clean up typing interval on error
     msgLog.error(`Error for user ${userId}: ${err.message}`);
@@ -399,6 +446,13 @@ async function main() {
     runCronPrompt(prompt, [...pluginTools])
   );
   log.info("Crons initialized");
+
+  // Register pre-clear hook for memory consolidation
+  onBeforeClear(async (userId, session) => {
+    log.info(`Pre-clear memory consolidation for user ${userId}`);
+    await runMemoryConsolidation(userId, session.messages);
+  });
+  log.info("Pre-clear memory hook registered");
 
   log.info("Starting bot...");
   bot.start();
